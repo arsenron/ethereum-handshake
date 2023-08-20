@@ -1,12 +1,13 @@
 mod handshake;
 mod mac;
 
-use std::io;
+use std::{io, net::SocketAddr};
 
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use cipher::StreamCipher;
 use handshake::{Handshake, HandshakeError, HandshakeStream};
 use num_bigint::BigInt;
+use regex::Regex;
 use rlp::{Encodable, RlpIterator, RlpStream};
 use secp256k1::{rand, PublicKey, SecretKey};
 use tokio::net::TcpStream;
@@ -107,7 +108,7 @@ impl Rlpx {
     }
 
     /// data = frame-ciphertext || frame-mac
-    /// 
+    ///
     /// Returns frame plaintext
     fn read_body(&mut self, mut data: Vec<u8>) -> Result<Vec<u8>, RlpxError> {
         let split_at = data.len() - 16;
@@ -119,7 +120,7 @@ impl Rlpx {
 
         self.ingress_aes.apply_keystream(frame_ciphertext);
         let decrypted = frame_ciphertext;
-        
+
         Ok(decrypted.to_owned())
     }
 }
@@ -146,7 +147,7 @@ enum RlpxState {
     Body(usize),
 }
 
-struct RlpxStream {
+pub struct RlpxStream {
     io: tokio_util::codec::Framed<TcpStream, Rlpx>,
 }
 
@@ -195,23 +196,46 @@ impl tokio_util::codec::Decoder for Rlpx {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EnodeId {
+    pub peer_id: [u8; 64],
+    pub socket_addr: SocketAddr,
+}
+
+impl<'a> TryFrom<&'a str> for EnodeId {
+    type Error = &'a str;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        let re = Regex::new(r"^enode://([0-9a-fA-F]{128})@(.*)").unwrap();
+        let captures = re.captures(value).ok_or(value)?;
+
+        let peer_id = captures.get(1).ok_or(value)?;
+        let peer_id = hex::decode(peer_id.as_str().as_bytes()).map_err(|_| value)?;
+
+        let socket_addr = captures.get(2).ok_or(value)?;
+        let socket_addr: SocketAddr = socket_addr.as_str().parse().map_err(|_| value)?;
+
+        Ok(EnodeId {
+            // cannot panic as we checked in regex that the length is 64 byte
+            peer_id: peer_id.try_into().unwrap(),
+            socket_addr,
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), HandshakeError> {
+    let enode_id = "enode://d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5@127.0.0.1:30303";
+    let enode_id: EnodeId = enode_id.try_into().unwrap();
+
     tracing_subscriber::fmt::init();
     info!("Starting the application");
 
     let secret_key = SecretKey::new(&mut rand::thread_rng());
-    // let ecies = Ecies::new(
-    //     secret_key,
-    //     Some(decode("b5948a2d3e9d486c4d75bf32713221c2bd6cf86463302339299bd227dc2e276cd5a1c7ca4f43a0e9122fe9af884efed563bd2a1fd28661f3b5f5ad7bf1de5949").unwrap().try_into().unwrap())
-    // );
-    let handshake = Handshake::new(
-        secret_key,
-        Some(hex::decode("d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5").unwrap().try_into().unwrap())
-    );
+    let handshake = Handshake::new(secret_key, Some(enode_id.peer_id));
 
     info!("Opening tcp connection to the remote node");
-    let mut handshake_stream = HandshakeStream::new("127.0.0.1:30303", handshake).await;
+    let mut handshake_stream = HandshakeStream::new(enode_id.socket_addr, handshake).await;
     let _session_secrets = handshake_stream.establish_session_keys().await?;
 
     Ok(())
