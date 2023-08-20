@@ -1,20 +1,12 @@
 #![allow(non_snake_case)]
 
 mod handshake;
+mod mac;
 
-use bytes::BufMut;
-use cipher::{BlockEncrypt, KeyIvInit, StreamCipher};
-use futures::{SinkExt, TryStreamExt};
 use handshake::{Handshake, HandshakeError, HandshakeStream};
-use hmac::Mac;
 use num_bigint::BigInt;
-use rand::Rng;
-use rlp::{Decodable, Encodable, RlpIterator, RlpStream};
+use rlp::{Encodable, RlpIterator, RlpStream};
 use secp256k1::{rand, PublicKey, SecretKey};
-use sha2::Digest;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::ToSocketAddrs;
-use tokio_util::codec::{Decoder, Encoder};
 use tracing::info;
 
 pub type Hash = [u8; 32];
@@ -38,6 +30,28 @@ pub static TESTNET_BOOTNODES : [&str; 7] = [
     "enode://d4f764a48ec2a8ecf883735776fdefe0a3949eb0ca476bd7bc8d0954a9defe8fea15ae5da7d40b5d2d59ce9524a99daedadf6da6283fca492cc80b53689fb3b3@46.4.99.122:32109",
     "enode://d2b720352e8216c9efc470091aa91ddafc53e222b32780f505c817ceef69e01d5b0b0797b69db254c586f493872352f5a022b4d8479a00fc92ec55f9ad46a27e@88.99.70.182:30303",
 ];
+
+#[tokio::main]
+async fn main() -> Result<(), HandshakeError> {
+    tracing_subscriber::fmt::init();
+    info!("Starting the application");
+
+    let secret_key = SecretKey::new(&mut rand::thread_rng());
+    // let ecies = Ecies::new(
+    //     secret_key,
+    //     Some(decode("b5948a2d3e9d486c4d75bf32713221c2bd6cf86463302339299bd227dc2e276cd5a1c7ca4f43a0e9122fe9af884efed563bd2a1fd28661f3b5f5ad7bf1de5949").unwrap().try_into().unwrap())
+    // );
+    let handshake = Handshake::new(
+        secret_key,
+        Some(hex::decode("d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5").unwrap().try_into().unwrap())
+    );
+
+    info!("Opening tcp connection to the remote node");
+    let mut handshake_stream = HandshakeStream::new("127.0.0.1:30303", handshake).await;
+    let _session_secrets = handshake_stream.establish_session_keys().await?;
+
+    Ok(())
+}
 
 pub fn ensure<E>(condition: bool, error: E) -> Result<(), E> {
     if condition {
@@ -117,84 +131,6 @@ fn rlp_next<const C: usize>(rlp: &mut RlpIterator) -> Result<[u8; C], rlp::Decod
         .as_val::<Vec<u8>>()?
         .try_into()
         .map_err(|_| rlp::DecoderError::RlpInvalidLength)?)
-}
-
-/// Continuously updated MAC states.
-///
-/// https://github.com/ethereum/devp2p/blob/master/rlpx.md#mac
-struct MacState {
-    /// Mac secret - keccak256(ephemeral-key || aes-secret)
-    secret: [u8; 32],
-    state: sha3::Keccak256,
-}
-
-impl MacState {
-    pub fn new(secret: [u8; 32]) -> Self {
-        Self {
-            secret,
-            state: sha3::Keccak256::new(),
-        }
-    }
-
-    /// Update the internal keccak256 hasher with the given data
-    pub fn update(&mut self, data: &[u8]) {
-        self.state.update(data)
-    }
-
-    pub fn update_header(&mut self, header_ciphertext: &[u8]) {
-        use cipher::KeyInit;
-        let mut encrypted = self.digest();
-        let aes = aes::Aes256Enc::new_from_slice(self.secret.as_ref()).unwrap();
-        aes.encrypt_padded::<block_padding::NoPadding>(&mut encrypted, 16)
-            .unwrap();
-        for i in 0..header_ciphertext.len() {
-            encrypted[i] ^= header_ciphertext[i];
-        }
-        self.state.update(encrypted)
-    }
-
-    /// Accumulate the given message body into the MAC's internal state.
-    pub fn update_frame(&mut self, frame_ciphertext: &[u8]) {
-        use cipher::KeyInit;
-        self.state.update(frame_ciphertext);
-        let prev = self.digest();
-        let aes = aes::Aes256Enc::new_from_slice(self.secret.as_ref()).unwrap();
-        let mut encrypted = self.digest();
-        aes.encrypt_padded::<block_padding::NoPadding>(&mut encrypted, 16)
-            .unwrap();
-        for i in 0..16 {
-            encrypted[i] ^= prev[i];
-        }
-        self.state.update(encrypted);
-    }
-
-    /// Returns last 16 byte of current's state hash
-    pub fn digest(&self) -> [u8; 16] {
-        let hash: [u8; 32] = self.state.clone().finalize().into();
-        hash[..16].try_into().unwrap()
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), HandshakeError> {
-    tracing_subscriber::fmt::init();
-    tracing::info!("Starting the application");
-
-    let secret_key = SecretKey::new(&mut rand::thread_rng());
-    // let ecies = Ecies::new(
-    //     secret_key,
-    //     Some(decode("b5948a2d3e9d486c4d75bf32713221c2bd6cf86463302339299bd227dc2e276cd5a1c7ca4f43a0e9122fe9af884efed563bd2a1fd28661f3b5f5ad7bf1de5949").unwrap().try_into().unwrap())
-    // );
-    let handshake = Handshake::new(
-        secret_key,
-        Some(hex::decode("d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5").unwrap().try_into().unwrap())
-    );
-
-    info!("Opening tcp connection to the remote node");
-    let mut handshake_stream = HandshakeStream::new("127.0.0.1:30303", handshake).await;
-    let _session_secrets = handshake_stream.establish_session_keys().await?;
-
-    Ok(())
 }
 
 pub fn id_to_public_key(id: [u8; 64]) -> Result<PublicKey, secp256k1::Error> {

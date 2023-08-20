@@ -1,4 +1,5 @@
-use crate::{MacState, IV};
+use crate::mac::MacState;
+use crate::IV;
 use bytes::{BufMut, Bytes, BytesMut};
 use cipher::KeyIvInit;
 use cipher::StreamCipher;
@@ -19,8 +20,6 @@ use tracing::info;
 pub enum HandshakeError {
     #[error("IO error")]
     IO(#[from] io::Error),
-    #[error("invalid auth data")]
-    InvalidAuthData,
     #[error("secp256k1 error - `{0:?}`")]
     Secp256k1(#[from] secp256k1::Error),
     #[error("tag check failure")]
@@ -97,7 +96,7 @@ pub struct Handshake {
     public_key: PublicKey,
     remote_public_key: Option<PublicKey>,
     local_nonce: [u8; 32],
-    ephemeral_public_key: PublicKey,
+    _ephemeral_public_key: PublicKey,
     ephemeral_private_key: SecretKey,
 
     // To be defined in the handshake process
@@ -107,6 +106,7 @@ pub struct Handshake {
     remote_init_msg: Option<Vec<u8>>,
     remote_nonce: Option<[u8; 32]>,
     ephemeral_shared_secret: Option<[u8; 32]>,
+    #[cfg(test)]
     remote_ephemeral_public_key: Option<PublicKey>,
 }
 
@@ -128,12 +128,13 @@ impl Handshake {
             remote_public_key,
             local_nonce: rand::thread_rng().gen(),
             ephemeral_private_key: ephemeral_secret_key,
-            ephemeral_public_key,
+            _ephemeral_public_key: ephemeral_public_key,
 
             remote_init_msg: None,
             local_init_msg: None,
             remote_nonce: None,
             ephemeral_shared_secret: None,
+            #[cfg(test)]
             remote_ephemeral_public_key: None,
         }
     }
@@ -287,10 +288,10 @@ impl Handshake {
 }
 
 pub struct SessionSecrets {
-    ingress_aes: Ctr64BE<aes::Aes256>,
-    egress_aes: Ctr64BE<aes::Aes256>,
-    ingress_mac: MacState,
-    egress_mac: MacState,
+    pub ingress_aes: Ctr64BE<aes::Aes256>,
+    pub egress_aes: Ctr64BE<aes::Aes256>,
+    pub ingress_mac: MacState,
+    pub egress_mac: MacState,
 }
 
 fn hmac_256(Km: &[u8], data: &[&[u8]]) -> [u8; 32] {
@@ -380,6 +381,7 @@ impl HandshakeStream {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use crate::test_utils::*;
@@ -431,7 +433,7 @@ mod tests {
             this.local_nonce = init_nonce;
             this.ephemeral_private_key = ephemeral_secret_key;
             let ephemeral_public_key = PublicKey::from_secret_key(SECP256K1, &ephemeral_secret_key);
-            this.ephemeral_public_key = ephemeral_public_key;
+            this._ephemeral_public_key = ephemeral_public_key;
             this
         }
 
