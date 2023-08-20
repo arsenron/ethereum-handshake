@@ -1,16 +1,21 @@
-#![allow(non_snake_case)]
-
 mod handshake;
 mod mac;
 
+use std::io;
+
+use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
+use cipher::StreamCipher;
 use handshake::{Handshake, HandshakeError, HandshakeStream};
 use num_bigint::BigInt;
 use rlp::{Encodable, RlpIterator, RlpStream};
 use secp256k1::{rand, PublicKey, SecretKey};
+use tokio::net::TcpStream;
 use tracing::info;
 
 pub type Hash = [u8; 32];
 pub type IV = [u8; 16];
+/// Header size + MAC size
+pub const HEADER_SIZE: usize = 32;
 
 /// Ethereum Foundation Go Bootnodes
 pub static MAINNET_BOOTNODES : [&str; 4] = [
@@ -30,6 +35,165 @@ pub static TESTNET_BOOTNODES : [&str; 7] = [
     "enode://d4f764a48ec2a8ecf883735776fdefe0a3949eb0ca476bd7bc8d0954a9defe8fea15ae5da7d40b5d2d59ce9524a99daedadf6da6283fca492cc80b53689fb3b3@46.4.99.122:32109",
     "enode://d2b720352e8216c9efc470091aa91ddafc53e222b32780f505c817ceef69e01d5b0b0797b69db254c586f493872352f5a022b4d8479a00fc92ec55f9ad46a27e@88.99.70.182:30303",
 ];
+
+pub struct Rlpx {
+    pub ingress_aes: ctr::Ctr64BE<aes::Aes256>,
+    pub egress_aes: ctr::Ctr64BE<aes::Aes256>,
+    pub ingress_mac: mac::MacState,
+    pub egress_mac: mac::MacState,
+    state: RlpxState,
+}
+impl Rlpx {
+    /// Writes `header-ciphertext || header-mac`
+    ///
+    /// header = frame-size || header-data || header-padding
+    ///
+    /// header-ciphertext = aes(aes-secret, header)
+    ///
+    /// frame-size = length of frame-data, encoded as a 24bit big-endian integer
+    /// header-data = [capability-id, context-id], always [0, 0] rlp
+    /// capability-id = integer, always zero
+    /// context-id = integer, always zero
+    /// header-padding = zero-fill header to 16-byte boundary
+    ///
+    /// Basically it is 3 bytes for length, 3 bytes for hardcoded RLP (header data) and
+    /// remaining 10 bytes as padding. In addition to it we also write a MAC,
+    /// consisting of 16 bytes. In total - 32 bytes.
+    fn write_header(&mut self, dst: &mut bytes::BytesMut, data_size: usize) {
+        dst.reserve(HEADER_SIZE); // header len (header + MAC)
+        let mut header = [0u8; 16];
+        // First write 3 bytes as length
+        BigEndian::write_uint(&mut header[..], data_size as u64, 3);
+        header[3..6].copy_from_slice(&[194, 128, 128]); // [0, 0] in RLP
+        self.egress_aes.apply_keystream(&mut header);
+        self.egress_mac.update_header(&header);
+        let tag = self.egress_mac.digest();
+
+        dst.extend_from_slice(&header);
+        dst.extend_from_slice(&tag);
+    }
+
+    /// frame-ciphertext || frame-mac
+    ///
+    /// frame-ciphertext = aes(aes-secret, frame-data || frame-padding)
+    /// frame-padding = zero-fill frame-data to 16-byte boundary
+    fn write_body(&mut self, dst: &mut bytes::BytesMut, mut data: Vec<u8>) {
+        let new_data_len = ((data.len() - 1) | 0b1111) + 1; // align to 16-byte boundary
+        data.resize(new_data_len, 0);
+        let frame_ciphertext = {
+            self.egress_aes.apply_keystream(&mut data);
+            data
+        };
+        self.egress_mac.update_body(&frame_ciphertext);
+        let frame_mac = self.egress_mac.digest();
+
+        dst.extend_from_slice(&frame_ciphertext);
+        dst.extend_from_slice(&frame_mac);
+    }
+
+    /// Reads header, verifies MAC and returns payload size
+    fn read_header(&mut self, mut header: bytes::BytesMut) -> Result<usize, RlpxError> {
+        let (header, mac) = header.split_at_mut(16);
+        self.ingress_mac.update_header(&header);
+        if self.ingress_mac.digest() != mac {
+            return Err(RlpxError::TagDecryptFailed);
+        }
+        self.ingress_aes.apply_keystream(header);
+
+        let header = header.to_vec();
+        let body_size = usize::try_from(header.as_slice().read_uint::<BigEndian>(3)?)?;
+
+        Ok(body_size)
+    }
+
+    /// data = frame-ciphertext || frame-mac
+    /// 
+    /// Returns frame plaintext
+    fn read_body(&mut self, mut data: Vec<u8>) -> Result<Vec<u8>, RlpxError> {
+        let split_at = data.len() - 16;
+        let (frame_ciphertext, mac) = data.split_at_mut(split_at);
+        self.ingress_mac.update_body(frame_ciphertext);
+        if self.ingress_mac.digest() != mac {
+            return Err(RlpxError::TagDecryptFailed);
+        }
+
+        self.ingress_aes.apply_keystream(frame_ciphertext);
+        let decrypted = frame_ciphertext;
+        
+        Ok(decrypted.to_owned())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RlpxError {
+    #[error("IO error")]
+    IO(#[from] io::Error),
+    #[error("secp256k1 error - `{0:?}`")]
+    Secp256k1(#[from] secp256k1::Error),
+    #[error("tag check failure")]
+    TagDecryptFailed,
+    #[error("invalid RLP")]
+    InvalidRlp(#[from] rlp::DecoderError),
+    #[error("Stream has been closed")]
+    StreamClosed,
+    #[error("Invalid size")]
+    FromInt(#[from] std::num::TryFromIntError),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RlpxState {
+    Header,
+    Body(usize),
+}
+
+struct RlpxStream {
+    io: tokio_util::codec::Framed<TcpStream, Rlpx>,
+}
+
+impl tokio_util::codec::Encoder<Vec<u8>> for Rlpx {
+    type Error = io::Error;
+
+    /// frame = header-ciphertext || header-mac || frame-ciphertext || frame-mac
+    fn encode(&mut self, data: Vec<u8>, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        self.write_header(dst, data.len()); // header-ciphertext || header-mac
+        self.write_body(dst, data); // frame-ciphertext || frame-mac
+
+        Ok(())
+    }
+}
+
+impl tokio_util::codec::Decoder for Rlpx {
+    type Item = Vec<u8>;
+
+    type Error = RlpxError;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        loop {
+            match self.state {
+                RlpxState::Header => {
+                    if src.len() < HEADER_SIZE {
+                        return Ok(None);
+                    }
+                    let header = src.split_to(HEADER_SIZE);
+                    let data_size = self.read_header(header)?;
+                    self.state = RlpxState::Body(data_size);
+                }
+                RlpxState::Body(data_size) => {
+                    // align to 16 byte boundary
+                    let aligned_size = ((data_size - 1) | 0b1111) + 1;
+                    if src.len() < aligned_size {
+                        return Ok(None);
+                    }
+                    let body_encrypted = src.split_to(aligned_size).to_vec();
+                    let body = self.read_body(body_encrypted)?;
+
+                    self.state = RlpxState::Header;
+                    return Ok(Some(body));
+                }
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), HandshakeError> {
@@ -159,6 +323,20 @@ mod tests {
     use super::*;
     use crate::test_utils::*;
     use num_bigint::Sign;
+
+    #[ignore]
+    #[test]
+    fn test() {
+        let s = [0, 0];
+        let e = rlp::encode(&&s[..]);
+        eprintln!("e = {:#?}", e.to_vec());
+
+        let s: Vec<u8> = rlp::decode_list(&[194, 128, 128]);
+        eprintln!("s = {:#?}", s);
+
+        let s = ((17 - 1) | 0b1111) + 1;
+        eprintln!("s = {:#?}", s);
+    }
 
     // Test data is taken from go-ethereum
     #[test]

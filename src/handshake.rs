@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use crate::mac::MacState;
 use crate::IV;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -28,6 +30,21 @@ pub enum HandshakeError {
     InvalidRlp(#[from] rlp::DecoderError),
     #[error("Stream has been closed")]
     StreamClosed,
+}
+
+fn hmac_256(Km: &[u8], data: &[&[u8]]) -> [u8; 32] {
+    let mac = Sha256::digest(Km);
+    let mut hmac = Hmac::<Sha256>::new_from_slice(mac.as_slice()).unwrap();
+    for d in data {
+        hmac.update(d)
+    }
+    hmac.finalize().into_bytes().into()
+}
+
+// Computes shared secret and returns only x coordinate
+fn create_shared_secret_x(remote_public_key: &PublicKey, private_key: &SecretKey) -> [u8; 32] {
+    let point = secp256k1::ecdh::shared_secret_point(remote_public_key, private_key);
+    point[0..32].try_into().unwrap()
 }
 
 struct AuthMessage {
@@ -294,21 +311,6 @@ pub struct SessionSecrets {
     pub egress_mac: MacState,
 }
 
-fn hmac_256(Km: &[u8], data: &[&[u8]]) -> [u8; 32] {
-    let mac = Sha256::digest(Km);
-    let mut hmac = Hmac::<Sha256>::new_from_slice(mac.as_slice()).unwrap();
-    for d in data {
-        hmac.update(d)
-    }
-    hmac.finalize().into_bytes().into()
-}
-
-// Computes shared secret and returns only x coordinate
-fn create_shared_secret_x(remote_public_key: &PublicKey, private_key: &SecretKey) -> [u8; 32] {
-    let point = secp256k1::ecdh::shared_secret_point(remote_public_key, private_key);
-    point[0..32].try_into().unwrap()
-}
-
 impl Encoder<()> for Handshake {
     type Error = io::Error;
 
@@ -350,6 +352,7 @@ impl Decoder for Handshake {
     }
 }
 
+// todo: docs
 pub struct HandshakeStream {
     io: Framed<TcpStream, Handshake>,
 }
