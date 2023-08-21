@@ -11,14 +11,42 @@ use rlpx::{Capability, Hello, ProtocolVersion, RlpxStream, ETH_68};
 use secp256k1::{rand, PublicKey, SecretKey, SECP256K1};
 use tracing::info;
 
+fn parse_args() -> EnodeId {
+    let Some(enode_id) = std::env::args().nth(1) else {
+        eprintln!(
+            "Please provide a `enode_id` of the remote \
+            host to run a handshake. For example with Cargo - `cargo run <enode_id>`"
+        );
+        std::process::exit(101);
+    };
+    let Ok(enode_id) = EnodeId::try_from(enode_id.as_str()) else {
+        eprintln!(
+            "Could not parse provided `enode id`. It should look like: \
+            `enode://9e9492e2e8836114cc75f5b929784f4f46c324ad01daf87d956f98b3b6c5fcba95524d6e5cf9861dc96a2c8a171ea7105bb554a197455058de185fa870970c7c@138.68.123.152:30303` "
+        );
+        std::process::exit(101);
+    };
+
+    enode_id
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let enode_id = "enode://9e9492e2e8836114cc75f5b929784f4f46c324ad01daf87d956f98b3b6c5fcba95524d6e5cf9861dc96a2c8a171ea7105bb554a197455058de185fa870970c7c@138.68.123.152:30303";
-    let enode_id = "enode://d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5@127.0.0.1:30303";
-    let enode_id: EnodeId = enode_id.try_into().unwrap();
-
     tracing_subscriber::fmt::init();
     info!("Starting the application");
+
+    if let Err(e) = run().await {
+        tracing::error!("Could not perform a handshake with a remote node. Error received - {e:?}")
+    }
+
+    info!("Bye!");
+
+    Ok(())
+}
+
+/// Actually performs a handshake process to a remote peer
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let enode_id = parse_args();
 
     let private_key = SecretKey::new(&mut rand::thread_rng());
     let public_key = PublicKey::from_secret_key(SECP256K1, &private_key);
@@ -30,20 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let hello_message = Hello {
         protocol_version: ProtocolVersion::V5,
-        client_id: "Ethereum(++)/1.0.0".into(),
-        capabilities: vec![
-            Capability::new("eth".into(), ETH_68),
-            Capability::new("random".into(), 23),
-        ],
+        client_id: "Beth/v1.2.0-super-stable-e501bs2h/redox-arm64/rust1.79".into(),
+        capabilities: vec![Capability::new("eth", ETH_68), Capability::new("beth", 328)],
         listen_port: 0,
-        peer_id: public_key_to_id(&public_key).to_vec(),
+        peer_id: public_key,
     };
 
     rlpx_stream.handshake(hello_message).await?;
     info!("Handshake succeeded! Closing the connection...");
     rlpx_stream.disconnect().await?;
-
-    info!("Bye!");
 
     Ok(())
 }
@@ -73,7 +96,9 @@ pub fn id_to_public_key(id: [u8; 64]) -> Result<PublicKey, secp256k1::Error> {
 }
 
 pub fn public_key_to_id(key: &PublicKey) -> [u8; 64] {
-    key.serialize_uncompressed()[1..].try_into().unwrap()
+    key.serialize_uncompressed()[1..]
+        .try_into()
+        .expect("Unfallible")
 }
 
 fn rlp_next<const C: usize>(rlp: &mut RlpIterator) -> Result<[u8; C], rlp::DecoderError> {
@@ -109,36 +134,5 @@ impl<'a> TryFrom<&'a str> for EnodeId {
             peer_id: peer_id.try_into().unwrap(),
             socket_addr,
         })
-    }
-}
-
-#[cfg(test)]
-pub mod test_utils {
-    pub fn to_hash(s: &str) -> [u8; 32] {
-        hex::decode(s).unwrap().try_into().unwrap()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rlpx::ETH_67;
-
-    #[test]
-    fn test_rlp_hello() {
-        let secret_key = SecretKey::new(&mut rand::thread_rng());
-        let peer_id = public_key_to_id(&secret_key.public_key(SECP256K1));
-        let mut hello = Hello {
-            protocol_version: ProtocolVersion::V5,
-            client_id: "ethereum-killer/0.1.0".to_string(),
-            capabilities: vec![Capability::new("eth".into(), ETH_67)],
-            listen_port: 30303,
-            peer_id: peer_id.to_vec(),
-        };
-
-        let encoded = rlp::encode(&mut hello).to_vec();
-        let decoded: Hello = rlp::decode(&encoded).unwrap();
-
-        assert_eq!(decoded, hello)
     }
 }

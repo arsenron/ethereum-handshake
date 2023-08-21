@@ -344,10 +344,10 @@ impl Decoder for Handshake {
             return Ok(None);
         }
         let payload_size = u16::from_be_bytes([src[0], src[1]]) as usize;
-        if payload_size > src.len() {
+        if src.len() < payload_size + 2 {
             return Ok(None);
         }
-        let auth_ack = self.read_ack(src.to_vec())?;
+        let auth_ack = self.read_ack(src.split_to(payload_size + 2).to_vec())?;
         self.remote_nonce = Some(auth_ack.nonce);
         self.ephemeral_shared_secret = Some(create_shared_secret_x(
             &auth_ack.remote_ephemeral_public_key,
@@ -362,12 +362,15 @@ pub struct HandshakeStream {
 }
 
 impl HandshakeStream {
+    /// Opens a [TcpStream] to a remote node.
+    ///
+    /// <b>Panics</b> if we are not able to connect to a remote host.
     pub async fn new(enode_id: crate::EnodeId, private_key: SecretKey) -> Self {
         let handshake = Handshake::new(private_key, Some(enode_id.peer_id));
         info!("Opening tcp connection to the remote node");
         let stream = TcpStream::connect(enode_id.socket_addr)
             .await
-            .expect("Could not connect to a remote node");
+            .expect("Could not open a Tcp connection to a remote node");
         info!("Established tcp connection to the remote node");
 
         Self {
@@ -379,8 +382,8 @@ impl HandshakeStream {
         self.io.into_inner()
     }
 
-    /// Send [AuthMessage] to the remote peer and wait for a [AuthAck].
-    /// After we establish secret keys for a session.
+    /// Sends an [AuthMessage] to the remote peer and waits for an [AuthAck].
+    /// After message exchange we establish secret keys for a session.
     pub async fn establish_session_keys(&mut self) -> Result<SessionSecrets, HandshakeError> {
         info!("Starting Ecies handshake");
         info!("Sending AuthMsg message");
@@ -391,7 +394,7 @@ impl HandshakeStream {
             .try_next()
             .await?
             .ok_or(HandshakeError::StreamClosed)?;
-        info!("Ack received");
+        info!("Ack received. Setting session keys.");
         Ok(session_secrets)
     }
 }
@@ -400,7 +403,6 @@ impl HandshakeStream {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
-    use crate::test_utils::*;
     use crate::{id_to_public_key, public_key_to_id, xor};
     use hex_literal::hex;
     use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
