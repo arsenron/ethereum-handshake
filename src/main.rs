@@ -4,7 +4,7 @@ pub mod rlpx;
 
 use std::net::SocketAddr;
 
-use handshake::{Handshake, HandshakeStream};
+use handshake::HandshakeStream;
 use regex::Regex;
 use rlp::RlpIterator;
 use rlpx::{Capability, Hello, ProtocolVersion, RlpxStream, ETH_68};
@@ -13,6 +13,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // let enode_id = "enode://9e9492e2e8836114cc75f5b929784f4f46c324ad01daf87d956f98b3b6c5fcba95524d6e5cf9861dc96a2c8a171ea7105bb554a197455058de185fa870970c7c@138.68.123.152:30303";
     let enode_id = "enode://d620a51a1d62564e9a9a127812e59ec82f3cade01db0abc51797a2f68e4db81ffe54aecd9bb943664f9f702583248d6905a1cbf957689209bae8f24d7254f6c5@127.0.0.1:30303";
     let enode_id: EnodeId = enode_id.try_into().unwrap();
 
@@ -21,23 +22,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let private_key = SecretKey::new(&mut rand::thread_rng());
     let public_key = PublicKey::from_secret_key(SECP256K1, &private_key);
-    let handshake = Handshake::new(private_key, Some(enode_id.peer_id));
 
-    let mut handshake_stream = HandshakeStream::new(enode_id.socket_addr, handshake).await;
+    let mut handshake_stream = HandshakeStream::new(enode_id, private_key).await;
     let session_secrets = handshake_stream.establish_session_keys().await?;
+
     let mut rlpx_stream = RlpxStream::new(handshake_stream.into_inner(), session_secrets);
 
     let hello_message = Hello {
         protocol_version: ProtocolVersion::V5,
         client_id: "Ethereum(++)/1.0.0".into(),
-        capabilities: vec![Capability::new("eth".into(), ETH_68)],
+        capabilities: vec![
+            Capability::new("eth".into(), ETH_68),
+            Capability::new("random".into(), 23),
+        ],
         listen_port: 0,
         peer_id: public_key_to_id(&public_key).to_vec(),
     };
 
     rlpx_stream.handshake(hello_message).await?;
+    info!("Handshake succeeded! Closing the connection...");
+    rlpx_stream.disconnect().await?;
 
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    info!("Bye!");
 
     Ok(())
 }
@@ -72,12 +78,11 @@ pub fn public_key_to_id(key: &PublicKey) -> [u8; 64] {
 
 fn rlp_next<const C: usize>(rlp: &mut RlpIterator) -> Result<[u8; C], rlp::DecoderError> {
     // cannot panic as we explicitly checked the length if the `rlp` iterator
-    Ok(rlp
-        .next()
+    rlp.next()
         .unwrap()
         .as_val::<Vec<u8>>()?
         .try_into()
-        .map_err(|_| rlp::DecoderError::RlpInvalidLength)?)
+        .map_err(|_| rlp::DecoderError::RlpInvalidLength)
 }
 
 #[derive(Debug, Clone)]

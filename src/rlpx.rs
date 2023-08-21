@@ -1,5 +1,5 @@
-use crate::handshake::SessionSecrets;
 use crate::mac;
+use crate::{ensure, handshake::SessionSecrets};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use cipher::StreamCipher;
 use futures::{SinkExt, TryStreamExt};
@@ -12,6 +12,8 @@ use tracing::info;
 pub const ETH_66: usize = 66;
 pub const ETH_67: usize = 67;
 pub const ETH_68: usize = 68;
+/// 16 mb
+const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Header size + MAC size
 const HEADER_SIZE: usize = 32;
@@ -20,11 +22,11 @@ const HEADER_SIZE: usize = 32;
 pub enum RlpxError {
     #[error("IO error")]
     IO(#[from] io::Error),
-    #[error("secp256k1 error - `{0:?}`")]
+    #[error("Secp256k1 error - `{0:?}`")]
     Secp256k1(#[from] secp256k1::Error),
-    #[error("tag check failure")]
+    #[error("Tag check failure")]
     TagDecryptFailed,
-    #[error("invalid RLP")]
+    #[error("Invalid RLP")]
     InvalidRlp(#[from] rlp::DecoderError),
     #[error("Stream has been closed")]
     StreamClosed,
@@ -32,6 +34,12 @@ pub enum RlpxError {
     FromInt(#[from] std::num::TryFromIntError),
     #[error("Unexpected message received")]
     UnexpectedMessage,
+    #[error("Payload is too large to consume")]
+    PayloadTooLarge,
+    #[error("Incompatible protocols")]
+    IncompatibleProtocols,
+    #[error("No matched capabilities with the remote peer")]
+    CapabilitiesMismatched,
 }
 
 pub struct Rlpx {
@@ -103,7 +111,7 @@ impl Rlpx {
     /// Reads header, verifies MAC and returns payload size
     fn read_header(&mut self, header: &mut [u8]) -> Result<usize, RlpxError> {
         let (header, mac) = header.split_at_mut(16);
-        self.ingress_mac.update_header(&header);
+        self.ingress_mac.update_header(header);
         if self.ingress_mac.digest() != mac {
             return Err(RlpxError::TagDecryptFailed);
         }
@@ -153,22 +161,54 @@ impl RlpxStream {
     }
 
     pub async fn handshake(&mut self, hello_msg: Hello) -> Result<(), RlpxError> {
-        let encoded = RlpxMessage::Hello(hello_msg.clone()).encode();
-
         info!("Sending hello message to the remote");
+
+        let encoded = RlpxMessage::Hello(hello_msg.clone()).encode();
         self.io.send(encoded).await?;
 
         let msg = self.io.try_next().await?.ok_or(RlpxError::StreamClosed)?;
         let rlpx_message = RlpxMessage::decode(msg)?;
         // We expect the first message to be hello
-        crate::ensure(
-            matches!(rlpx_message, RlpxMessage::Hello(_)),
-            RlpxError::UnexpectedMessage,
-        )?;
-        info!("Received hello message from the remote: {rlpx_message:?}");
+        let RlpxMessage::Hello(remote_hello_msg) = rlpx_message else {
+            return Err(RlpxError::UnexpectedMessage);
+        };
+        info!("Received hello message from the remote: {remote_hello_msg:?}");
         info!("Verifying capabilities");
 
+        ensure(
+            hello_msg.protocol_version == remote_hello_msg.protocol_version,
+            RlpxError::IncompatibleProtocols,
+        )?;
+        let shared_capabilities =
+            self.find_shared_capabilitires(hello_msg.capabilities, remote_hello_msg.capabilities);
+        ensure(
+            !shared_capabilities.is_empty(),
+            RlpxError::UnexpectedMessage,
+        )?;
+
+        info!("Shared capabilities with the remote peer - {shared_capabilities:?}");
+
         Ok(())
+    }
+
+    pub async fn disconnect(&mut self) -> Result<(), RlpxError> {
+        // todo: this MUST be snappy compressed
+        let disconnect = RlpxMessage::Disconnect(Disconnect { reason: 0x08 }).encode();
+        self.io.send(disconnect).await?;
+
+        Ok(())
+    }
+
+    fn find_shared_capabilitires(
+        &self,
+        local: Vec<Capability>,
+        remote: Vec<Capability>,
+    ) -> Vec<Capability> {
+        local
+            .iter()
+            .filter(|lc| remote.iter().any(|rc| &rc == lc))
+            .cloned()
+            .collect()
     }
 }
 
@@ -198,14 +238,17 @@ impl Decoder for Rlpx {
                     }
                     let mut header = src.split_to(HEADER_SIZE);
                     let body_size = self.read_header(header.as_mut())?;
+                    if body_size >= MAX_PAYLOAD_SIZE {
+                        return Err(RlpxError::PayloadTooLarge);
+                    }
                     self.state = RlpxState::Body(body_size);
                 }
-                RlpxState::Body(data_size) => {
-                    let expected_size = if data_size % 16 == 0 {
-                        data_size
+                RlpxState::Body(body_size) => {
+                    let expected_size = if body_size % 16 == 0 {
+                        body_size
                     } else {
-                        // align to 16 bytes + 16 byte for mac
-                        (data_size | 31) + 1
+                        // align data to 16 bytes + 16 byte for mac
+                        (body_size | 31) + 1
                     };
                     if src.len() < expected_size {
                         return Ok(None);
@@ -213,8 +256,8 @@ impl Decoder for Rlpx {
                     let body_encrypted = src.split_to(expected_size).to_vec();
                     let mut body = self.read_body(body_encrypted)?;
                     // Pop padded data
-                    if data_size != expected_size {
-                        for _ in 0..expected_size - data_size - 16 {
+                    if body_size != expected_size {
+                        for _ in 0..expected_size - body_size - 16 {
                             body.pop();
                         }
                     }
@@ -305,11 +348,19 @@ pub struct Ping {}
 #[derive(Debug, Clone, RlpDecodable, RlpEncodable)]
 pub struct Pong {}
 
+// todo(type safety): make `reason` as Enum instead of u8
 #[derive(Debug, Clone, RlpDecodable, RlpEncodable)]
 pub struct Disconnect {
     pub reason: u8,
 }
 
+impl Disconnect {
+    pub const MESSAGE_ID: u8 = 0x01;
+}
+
+/// Rlpx messages.
+///
+/// https://github.com/ethereum/devp2p/blob/master/rlpx.md#p2p-capability
 #[derive(Debug, Clone)]
 pub enum RlpxMessage {
     Hello(Hello),
@@ -323,8 +374,13 @@ impl RlpxMessage {
         let mut out: Vec<u8> = Vec::new();
         match self {
             RlpxMessage::Hello(hello) => {
-                out.push(Hello::MESSAGE_ID);
+                out.extend(rlp::encode(&Hello::MESSAGE_ID));
                 let encoded = rlp::encode(hello);
+                out.extend(encoded)
+            }
+            RlpxMessage::Disconnect(disconnect) => {
+                out.extend(rlp::encode(&Disconnect::MESSAGE_ID));
+                let encoded = rlp::encode(disconnect);
                 out.extend(encoded)
             }
             _ => unimplemented!(),
@@ -336,7 +392,7 @@ impl RlpxMessage {
         let (message_id, encoded) = data.as_ref().split_at(1);
         let message_id: u8 = rlp::decode(message_id)?;
         match message_id {
-            Hello::MESSAGE_ID => Ok(Self::Hello(rlp::decode(&encoded)?)),
+            Hello::MESSAGE_ID => Ok(Self::Hello(rlp::decode(encoded)?)),
             _ => unimplemented!(),
         }
     }

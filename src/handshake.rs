@@ -13,7 +13,7 @@ use rlp::{Decodable, Encodable, RlpStream};
 use secp256k1::{PublicKey, SecretKey, SECP256K1};
 use sha2::Sha256;
 use std::io;
-use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::info;
 
@@ -131,13 +131,8 @@ pub struct Handshake {
 impl Handshake {
     pub fn new(private_key: SecretKey, remote_enode_id: Option<[u8; 64]>) -> Self {
         let public_key = PublicKey::from_secret_key(SECP256K1, &private_key);
-        let remote_public_key = {
-            if let Some(id) = remote_enode_id {
-                Some(crate::id_to_public_key(id).expect("Unfallible"))
-            } else {
-                None
-            }
-        };
+        let remote_public_key =
+            remote_enode_id.map(|id| crate::id_to_public_key(id).expect("Unfallible"));
         let ephemeral_secret_key = SecretKey::new(&mut rand::thread_rng());
         let ephemeral_public_key = PublicKey::from_secret_key(SECP256K1, &ephemeral_secret_key);
         Self {
@@ -367,9 +362,10 @@ pub struct HandshakeStream {
 }
 
 impl HandshakeStream {
-    pub async fn new<A: ToSocketAddrs>(addr: A, handshake: Handshake) -> Self {
+    pub async fn new(enode_id: crate::EnodeId, private_key: SecretKey) -> Self {
+        let handshake = Handshake::new(private_key, Some(enode_id.peer_id));
         info!("Opening tcp connection to the remote node");
-        let stream = TcpStream::connect(addr)
+        let stream = TcpStream::connect(enode_id.socket_addr)
             .await
             .expect("Could not connect to a remote node");
         info!("Established tcp connection to the remote node");
@@ -383,9 +379,12 @@ impl HandshakeStream {
         self.io.into_inner()
     }
 
+    /// Send [AuthMessage] to the remote peer and wait for a [AuthAck].
+    /// After we establish secret keys for a session.
     pub async fn establish_session_keys(&mut self) -> Result<SessionSecrets, HandshakeError> {
         info!("Starting Ecies handshake");
         info!("Sending AuthMsg message");
+        // See Encoder / Decoder implementation above
         self.io.send(()).await?;
         let session_secrets = self
             .io
