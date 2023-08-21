@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 
 use crate::mac::MacState;
-use crate::IV;
 use bytes::{BufMut, Bytes, BytesMut};
 use cipher::KeyIvInit;
 use cipher::StreamCipher;
@@ -17,6 +16,8 @@ use std::io;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::info;
+
+type IV = [u8; 16];
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
@@ -132,7 +133,7 @@ impl Handshake {
         let public_key = PublicKey::from_secret_key(SECP256K1, &private_key);
         let remote_public_key = {
             if let Some(id) = remote_enode_id {
-                Some(crate::id_to_public_key(id).unwrap())
+                Some(crate::id_to_public_key(id).expect("Unfallible"))
             } else {
                 None
             }
@@ -193,6 +194,8 @@ impl Handshake {
         encrypted
     }
 
+    /// auth-vsn = 4
+    /// auth-body = [sig, initiator-pubk, initiator-nonce, auth-vsn, ...]
     fn create_auth_message(&self) -> AuthMessage {
         let mut x = create_shared_secret_x(&self.remote_public_key.unwrap(), &self.private_key);
         // xor in-place
@@ -314,6 +317,13 @@ pub struct SessionSecrets {
 impl Encoder<()> for Handshake {
     type Error = io::Error;
 
+    /// auth = auth-size || enc-auth-body
+    ///
+    /// auth-size = size of enc-auth-body, encoded as a big-endian 16-bit integer
+    /// auth-vsn = 4
+    /// auth-body = [sig, initiator-pubk, initiator-nonce, auth-vsn, ...]
+    /// enc-auth-body = ecies.encrypt(recipient-pubk, auth-body || auth-padding, auth-size)
+    /// auth-padding = arbitrary data
     fn encode(&mut self, _item: (), dst: &mut BytesMut) -> Result<(), Self::Error> {
         let auth_message = self.create_auth_message();
         let mut encoded_auth_message = rlp::encode(&auth_message);
@@ -322,9 +332,9 @@ impl Encoder<()> for Handshake {
         encoded_auth_message.resize(rand::thread_rng().gen_range(200..=300), 0);
         let encrypted = self.encrypt_message(encoded_auth_message.into());
         let total_size = encrypted.len() as u16;
-        self.local_init_msg = Some(encrypted.to_vec());
         dst.extend_from_slice(total_size.to_be_bytes().as_slice());
         dst.extend_from_slice(encrypted.as_ref());
+        self.local_init_msg = Some(dst.to_vec());
 
         Ok(())
     }
@@ -352,13 +362,13 @@ impl Decoder for Handshake {
     }
 }
 
-// todo: docs
 pub struct HandshakeStream {
     io: Framed<TcpStream, Handshake>,
 }
 
 impl HandshakeStream {
     pub async fn new<A: ToSocketAddrs>(addr: A, handshake: Handshake) -> Self {
+        info!("Opening tcp connection to the remote node");
         let stream = TcpStream::connect(addr)
             .await
             .expect("Could not connect to a remote node");
@@ -367,6 +377,10 @@ impl HandshakeStream {
         Self {
             io: handshake.framed(stream),
         }
+    }
+
+    pub fn into_inner(self) -> TcpStream {
+        self.io.into_inner()
     }
 
     pub async fn establish_session_keys(&mut self) -> Result<SessionSecrets, HandshakeError> {

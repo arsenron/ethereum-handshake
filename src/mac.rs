@@ -23,11 +23,11 @@ impl MacState {
     }
 
     /// header-mac-seed = aes(mac-secret, keccak256.digest(egress-mac)[:16]) ^ header-ciphertext
-    /// 
+    ///
     /// Update with header-mac-seed
     pub fn update_header(&mut self, header_ciphertext: &[u8]) {
         use cipher::{BlockEncrypt, KeyInit};
-        let mut encrypted = self.digest(); // 
+        let mut encrypted = self.digest(); //
         let aes = aes::Aes256Enc::new_from_slice(self.secret.as_ref()).unwrap();
         aes.encrypt_padded::<block_padding::NoPadding>(&mut encrypted, 16)
             .unwrap();
@@ -38,7 +38,7 @@ impl MacState {
     }
 
     /// Accumulate the given message body into the MAC's internal state.
-    /// 
+    ///
     /// frame-mac-seed = aes(mac-secret, keccak256.digest(egress-mac)[:16]) ^ keccak256.digest(egress-mac)[:16]
     pub fn update_body(&mut self, frame_ciphertext: &[u8]) {
         use cipher::{BlockEncrypt, KeyInit};
@@ -55,7 +55,7 @@ impl MacState {
     }
 
     /// Returns last 16 byte of current's state hash.
-    /// 
+    ///
     /// In Ethereum docs: keccak256.digest(mac)[:16]
     pub fn digest(&self) -> [u8; 16] {
         let hash: [u8; 32] = self.state.clone().finalize().into();
