@@ -35,7 +35,7 @@ pub enum HandshakeError {
 
 fn hmac_256(Km: &[u8], data: &[&[u8]]) -> [u8; 32] {
     let mac = Sha256::digest(Km);
-    let mut hmac = Hmac::<Sha256>::new_from_slice(mac.as_slice()).unwrap();
+    let mut hmac = Hmac::<Sha256>::new_from_slice(mac.as_slice()).expect("Unfallible");
     for d in data {
         hmac.update(d)
     }
@@ -45,7 +45,7 @@ fn hmac_256(Km: &[u8], data: &[&[u8]]) -> [u8; 32] {
 // Computes shared secret and returns only x coordinate
 fn create_shared_secret_x(remote_public_key: &PublicKey, private_key: &SecretKey) -> [u8; 32] {
     let point = secp256k1::ecdh::shared_secret_point(remote_public_key, private_key);
-    point[0..32].try_into().unwrap()
+    point[0..32].try_into().expect("Unfallible")
 }
 
 struct AuthMessage {
@@ -90,6 +90,7 @@ impl Decodable for AuthMessage {
 }
 
 /// The first message a server sends to a client
+#[derive(Debug, Clone)]
 struct AuthAck {
     remote_ephemeral_public_key: PublicKey,
     nonce: [u8; 32],
@@ -220,8 +221,6 @@ impl Handshake {
     fn decrypt_message(&self, data: Vec<u8>) -> Result<Vec<u8>, HandshakeError> {
         let mut data = Bytes::from(data);
         let total_size_bytes = data.split_to(2);
-        let total_size = u16::from_be_bytes([total_size_bytes[0], total_size_bytes[1]]);
-        debug_assert!(data.len() >= total_size as usize);
         let public_key = PublicKey::from_slice(&data.split_to(65))?;
 
         let iv = data.split_to(16);
@@ -340,14 +339,16 @@ impl Decoder for Handshake {
     type Error = HandshakeError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // first two bytes are the length of the packet
         if src.len() < 2 {
             return Ok(None);
         }
-        let payload_size = u16::from_be_bytes([src[0], src[1]]) as usize;
-        if src.len() < payload_size + 2 {
+        let payload_size = u16::from_be_bytes([src[0], src[1]]) as usize + 2;
+        if src.len() < payload_size {
             return Ok(None);
         }
-        let auth_ack = self.read_ack(src.split_to(payload_size + 2).to_vec())?;
+        let auth_ack = self.read_ack(src.split_to(payload_size).to_vec())?;
+        tracing::info!("Ack received - {:x?}", auth_ack);
         self.remote_nonce = Some(auth_ack.nonce);
         self.ephemeral_shared_secret = Some(create_shared_secret_x(
             &auth_ack.remote_ephemeral_public_key,
@@ -378,6 +379,10 @@ impl HandshakeStream {
         }
     }
 
+    pub fn read_buffer(&self) -> Vec<u8> {
+        self.io.read_buffer().to_vec()
+    }
+
     pub fn into_inner(self) -> TcpStream {
         self.io.into_inner()
     }
@@ -394,7 +399,7 @@ impl HandshakeStream {
             .try_next()
             .await?
             .ok_or(HandshakeError::StreamClosed)?;
-        info!("Ack received. Setting session keys.");
+        info!("Setting session keys.");
         Ok(session_secrets)
     }
 }

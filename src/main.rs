@@ -54,12 +54,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut handshake_stream = HandshakeStream::new(enode_id, private_key).await;
     let session_secrets = handshake_stream.establish_session_keys().await?;
 
-    let mut rlpx_stream = RlpxStream::new(handshake_stream.into_inner(), session_secrets);
+    let mut rlpx_stream = RlpxStream::new(handshake_stream, session_secrets);
 
     let hello_message = Hello {
         protocol_version: ProtocolVersion::V5,
         client_id: "Beth/v1.2.0-super-stable-e501bs2h/redox-arm64/rust1.79".into(),
-        capabilities: vec![Capability::new("eth", ETH_68), Capability::new("beth", 328)],
+        capabilities: vec![Capability::new("eth", ETH_68), Capability::new("les", 4)],
         listen_port: 0,
         peer_id: public_key,
     };

@@ -1,3 +1,4 @@
+use crate::handshake::HandshakeStream;
 use crate::{ensure, handshake::SessionSecrets};
 use crate::{id_to_public_key, mac, public_key_to_id};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
@@ -158,12 +159,14 @@ pub struct RlpxStream {
 }
 
 impl RlpxStream {
-    pub fn new(io: TcpStream, secrets: SessionSecrets) -> Self {
+    pub fn new(handshake_stream: HandshakeStream, secrets: SessionSecrets) -> Self {
+        // in case we also received a `Hello` message in previous stream, we
+        // transfer the remaining bytes to a new rlpx stream.
+        let buf_remaining = handshake_stream.read_buffer();
         let rlpx = Rlpx::new(secrets);
-
-        Self {
-            io: rlpx.framed(io),
-        }
+        let mut io = rlpx.framed(handshake_stream.into_inner());
+        io.read_buffer_mut().extend_from_slice(&buf_remaining);
+        Self { io }
     }
 
     pub async fn handshake(&mut self, hello_msg: Hello) -> Result<(), RlpxError> {
