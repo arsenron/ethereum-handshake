@@ -29,14 +29,16 @@ RLPx protocol - is a TCP-based transport protocol used for communication among E
 Very simple. Just provide one argument to the binary, that is `enode_id` (See https://ethereum.org/en/developers/docs/networking-layer/network-addresses/#enode). For example, you can try the following:
 
 ```sh
-cargo run enode://143e11fb766781d22d92a2e33f8f104cddae4411a122295ed1fdb6638de96a6ce65f5b7c964ba3763bba27961738fef7d3ecc739268f3e5e771fb4c87b6234ba@146.190.1.103:30303
+cargo run "enode://143e11fb766781d22d92a2e33f8f104cddae4411a122295ed1fdb6638de96a6ce65f5b7c964ba3763bba27961738fef7d3ecc739268f3e5e771fb4c87b6234ba@146.190.1.103:30303"
 ```
+
+A lot of public bootnodes are available here: https://github.com/ledgerwatch/erigon/blob/devel/params/bootnodes.go
 
 Here is one caveat. All the public nodes are protected meaning that there are some limits of how many connections per frame of time can be established. That means that if we try to establish handshake two times in a row, the second attempt will likely fail. But it will work after some time again.
 
 To test against the local node, one simple solution would be to run a node inside a docker container. To have a `geth` node running, enter the following command:
 
 ```sh
-docker run -p 8545:8545 -p 30303:30303 ethereum/client-go --syncmode light
+docker run -p 30303:30303 ethereum/client-go --syncmode light
 ```
 In the logs, in the last few lines, you will see your `enode_id`. So just provide it to the app.

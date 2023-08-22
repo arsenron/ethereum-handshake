@@ -159,6 +159,7 @@ pub struct RlpxStream {
 }
 
 impl RlpxStream {
+    /// Updates `HandshakeStream` to `RlpxStream`
     pub fn new(handshake_stream: HandshakeStream, secrets: SessionSecrets) -> Self {
         // in case we also received a `Hello` message in previous stream, we
         // transfer the remaining bytes to a new rlpx stream.

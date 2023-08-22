@@ -120,7 +120,7 @@ impl<'a> TryFrom<&'a str> for EnodeId {
     type Error = &'a str;
 
     fn try_from(value: &'a str) -> Result<Self, Self::Error> {
-        let re = Regex::new(r"^enode://([0-9a-fA-F]{128})@(.*)").expect("Unfallible");
+        let re = Regex::new(r"^enode://([0-9a-fA-F]{128})@([0-9a-f.:]+:\d+)?").expect("Unfallible");
         let captures = re.captures(value).ok_or(value)?;
 
         let peer_id = captures.get(1).ok_or(value)?;
